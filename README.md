@@ -23,6 +23,15 @@ The following surgical video/image datasets were used:
 - **Outperformed SOTA** on 24/30 (80%) of all organ classes.
 - **Generalization**: Outperformed SOTA on 7/9 (**77.8%**) of unseen organ classes.
 
+## Fine-tuned Model Checkpoints
+The fine-tuned SurgiSAM2 model checkpoints are available at:
+[https://figshare.com/articles/media/SurgiSAM2_Fine-tuning_a_foundational_model_for_surgical_video_anatomy_segmentation_and_detection/28489961](https://figshare.com/articles/media/SurgiSAM2_Fine-tuning_a_foundational_model_for_surgical_video_anatomy_segmentation_and_detection/28489961)
+
+## Citation
+If you use SurgiSAM2 in your research, please cite our paper published in Scientific Reports:
+
+Kamtam, D.N., Shrager, J.B., Malla, S.D. et al. A fine-tuned foundational model SurgiSAM2 for surgical video anatomy segmentation and detection. Sci Rep 15, 17098 (2025). https://doi.org/10.1038/s41598-025-11759-4
+
 ## References
 
 1. [https://arxiv.org/abs/2012.12453](https://arxiv.org/abs/2012.12453)
