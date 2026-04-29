@@ -42,7 +42,9 @@ def _():
 def _():
     import random
     import shutil
+    import threading
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
 
     import altair as alt
@@ -52,7 +54,20 @@ def _():
     import torch
     from PIL import Image
 
-    return Image, Path, alt, cv2, np, pl, shutil, time, torch
+    return (
+        Image,
+        Path,
+        ThreadPoolExecutor,
+        alt,
+        as_completed,
+        cv2,
+        np,
+        pl,
+        shutil,
+        threading,
+        time,
+        torch,
+    )
 
 
 @app.cell(hide_code=True)
@@ -124,6 +139,10 @@ def _(Path, mo):
 
     num_points = mo.ui.number(start=1, stop=50, step=1, value=1, label="Points per prompt")
     seed = mo.ui.number(start=0, stop=2**31 - 1, step=1, value=42, label="Random seed")
+    max_workers = mo.ui.number(
+        start=1, stop=64, step=1, value=4,
+        label="Worker threads (1 = serial)",
+    )
 
     load_button = mo.ui.run_button(label="Load model")
     run_button = mo.ui.run_button(label="Run inference + metrics")
@@ -133,6 +152,7 @@ def _(Path, mo):
         datasets,
         eval_results_dir,
         load_button,
+        max_workers,
         model_preset,
         num_points,
         run_button,
@@ -148,6 +168,7 @@ def _(
     datasets,
     eval_results_dir,
     load_button,
+    max_workers,
     mo,
     model_preset,
     num_points,
@@ -161,7 +182,7 @@ def _(
         sam_configs_dir,
         eval_results_dir,
         mo.hstack([datasets, split], justify="start"),
-        mo.hstack([model_preset, num_points, seed], justify="start"),
+        mo.hstack([model_preset, num_points, seed, max_workers], justify="start"),
         mo.hstack([load_button, run_button], justify="start"),
     ])
     return
@@ -358,8 +379,11 @@ def _(mo):
 @app.cell
 def _(
     Image,
+    ThreadPoolExecutor,
+    as_completed,
     cv2,
     datasets,
+    max_workers,
     mo,
     np,
     num_points,
@@ -371,61 +395,136 @@ def _(
     select_point_prompt,
     shutil,
     split,
+    threading,
     time,
     torch,
 ):
     mo.stop(not run_button.value, mo.md("_Press **Run inference + metrics** to start._"))
     mo.stop(pairs_df.height == 0, mo.md("_No pairs discovered — check dataset root._"))
 
-    def _run_inference() -> tuple[int, list[str], float]:
+    def _run_inference() -> tuple[int, list[str], list[str], float]:
         # Idempotent reset of PredictedMasks for the chosen (dataset, split).
         for ds in datasets.value:
             pmask_dir = root / ds / split.value / "PredictedMasks"
             if pmask_dir.exists():
                 shutil.rmtree(pmask_dir)
 
-        rng = np.random.default_rng(seed.value)
+        # Per-work-item RNG so sampled prompt points are deterministic
+        # regardless of thread scheduling. SeedSequence.spawn gives each
+        # row its own independent, well-distributed substream.
+        rows = list(pairs_df.iter_rows(named=True))
+        ss = np.random.SeedSequence(seed.value)
+        child_seeds = ss.spawn(len(rows))
+
+        # Predictor mutates shared GPU state inside set_image/predict, so
+        # those calls must be serialized. Threads still parallelize image
+        # decoding and disk writes (the I/O-bound bits).
+        predictor_lock = threading.Lock()
+        # mkdir is idempotent with exist_ok=True, but a lock keeps the
+        # syscall pattern matching the original notebook and avoids any
+        # filesystem races when many threads try to create the same dir.
+        output_lock = threading.Lock()
+
         skipped: list[str] = []
-        n_done = 0
-        t_start = time.time()
+        errors: list[str] = []
+        skipped_lock = threading.Lock()
+        n_points_local = num_points.value
 
-        for r in pairs_df.iter_rows(named=True):
-            with Image.open(r["frame_path"]) as fi:
-                frame_rgb = np.array(fi.convert("RGB"))
-            with Image.open(r["mask_path"]) as mi:
-                gt_mask = np.array(mi.convert("L"))
+        def _process(idx: int, r: dict) -> bool:
+            try:
+                with Image.open(r["frame_path"]) as fi:
+                    frame_rgb = np.array(fi.convert("RGB"))
+                with Image.open(r["mask_path"]) as mi:
+                    gt_mask = np.array(mi.convert("L"))
 
-            pts, labels = select_point_prompt(gt_mask, num_points.value, rng)
-            if pts is None:
-                skipped.append(f"{r['class_name']}/{r['image_id']}")
-                continue
+                rng = np.random.default_rng(child_seeds[idx])
+                pts, labels = select_point_prompt(gt_mask, n_points_local, rng)
+                if pts is None:
+                    with skipped_lock:
+                        skipped.append(f"{r['class_name']}/{r['image_id']}")
+                    return False
 
-            predictor.set_image(frame_rgb)
-            with torch.no_grad():
-                masks_out, _, _ = predictor.predict(
-                    point_coords=np.array(pts),
-                    point_labels=np.array(labels),
-                    multimask_output=False,
+                with predictor_lock:
+                    predictor.set_image(frame_rgb)
+                    with torch.no_grad():
+                        masks_out, _, _ = predictor.predict(
+                            point_coords=np.array(pts),
+                            point_labels=np.array(labels),
+                            multimask_output=False,
+                        )
+                binary = (masks_out[0] > 0.5).astype(np.uint8) * 255
+
+                out_path = (
+                    root / r["dataset"] / r["split"]
+                    / "PredictedMasks" / r["class_name"] / f"{r['image_id']}.png"
                 )
-            binary = (masks_out[0] > 0.5).astype(np.uint8) * 255
+                with output_lock:
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_path), binary)
+                return True
+            except Exception as e:  # noqa: BLE001 — surface any per-image failure
+                with skipped_lock:
+                    errors.append(f"{r['class_name']}/{r['image_id']}: {e!r}")
+                return False
 
-            out_path = (
-                root / r["dataset"] / r["split"]
-                / "PredictedMasks" / r["class_name"] / f"{r['image_id']}.png"
-            )
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out_path), binary)
-            n_done += 1
+        t_start = time.time()
+        n_done = 0
+        n_workers = max(1, int(max_workers.value))
 
-        return n_done, skipped, time.time() - t_start
+        # Marimo's progress bar renders inline in the cell. We drive it from
+        # the main thread (workers just produce results); subtitle is updated
+        # with throughput so you can see if the pool is starved on I/O.
+        with mo.status.progress_bar(
+            total=len(rows),
+            title=f"SAM2 inference ({n_workers} worker{'s' if n_workers != 1 else ''})",
+            subtitle="starting…",
+            remove_on_exit=False,
+        ) as bar:
+            n_processed = 0
 
-    n_written, skipped_no_points, elapsed = _run_inference()
+            def _tick(success: bool) -> None:
+                nonlocal n_done, n_processed
+                if success:
+                    n_done += 1
+                n_processed += 1
+                elapsed_so_far = time.time() - t_start
+                rate = n_processed / elapsed_so_far if elapsed_so_far > 0 else 0.0
+                bar.update(
+                    increment=1,
+                    subtitle=(
+                        f"{n_done} ok · {len(skipped)} skipped · {len(errors)} err · "
+                        f"{rate:.1f} img/s"
+                    ),
+                )
+
+            if n_workers == 1:
+                # Skip the thread pool entirely when serial — keeps profiling clean.
+                for i, r in enumerate(rows):
+                    ok = _process(i, r)
+                    _tick(ok)
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                    futures = [executor.submit(_process, i, r) for i, r in enumerate(rows)]
+                    for fut in as_completed(futures):
+                        _tick(fut.result())
+
+        return n_done, skipped, errors, time.time() - t_start
+
+    n_written, skipped_no_points, error_list, elapsed = _run_inference()
     inference_done = True
+
+    _err_md = ""
+    if error_list:
+        _shown = "\n".join(f"- `{e}`" for e in error_list[:10])
+        _more = "" if len(error_list) <= 10 else f"\n- _…and {len(error_list) - 10} more_"
+        _err_md = f"\n\n**Errors**: {len(error_list)}\n{_shown}{_more}"
 
     mo.md(
         f"**Inference complete** in {elapsed:.1f}s  \n"
+        f"**Workers**: {max(1, int(max_workers.value))}  \n"
         f"**Predicted masks written**: {n_written}  \n"
         f"**Skipped (mask had < num_points foreground pixels)**: {len(skipped_no_points)}"
+        f"{_err_md}"
     )
     return (inference_done,)
 
