@@ -31,15 +31,16 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     import marimo as mo
 
     return (mo,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
+    import contextlib
     import random
     import shutil
     import threading
@@ -60,6 +61,7 @@ def _():
         ThreadPoolExecutor,
         alt,
         as_completed,
+        contextlib,
         cv2,
         np,
         pl,
@@ -140,8 +142,12 @@ def _(Path, mo):
     num_points = mo.ui.number(start=1, stop=50, step=1, value=1, label="Points per prompt")
     seed = mo.ui.number(start=0, stop=2**31 - 1, step=1, value=42, label="Random seed")
     max_workers = mo.ui.number(
-        start=1, stop=64, step=1, value=4,
+        start=1, stop=64, step=1, value=2,
         label="Worker threads (1 = serial)",
+    )
+    use_bf16 = mo.ui.checkbox(
+        value=True,
+        label="bf16 autocast (CUDA only)",
     )
 
     load_button = mo.ui.run_button(label="Load model")
@@ -159,6 +165,7 @@ def _(Path, mo):
         sam_configs_dir,
         seed,
         split,
+        use_bf16,
     )
 
 
@@ -176,13 +183,14 @@ def _(
     sam_configs_dir,
     seed,
     split,
+    use_bf16,
 ):
     mo.vstack([
         dataset_root,
         sam_configs_dir,
         eval_results_dir,
         mo.hstack([datasets, split], justify="start"),
-        mo.hstack([model_preset, num_points, seed, max_workers], justify="start"),
+        mo.hstack([model_preset, num_points, seed, max_workers, use_bf16], justify="start"),
         mo.hstack([load_button, run_button], justify="start"),
     ])
     return
@@ -196,7 +204,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(cv2, np):
     def select_point_prompt(mask: np.ndarray, num_points: int, rng):
         """Sample foreground points (mask == 255). Returns (points, labels) or (None, None).
@@ -252,7 +260,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(Path, dataset_root, datasets, mo, pl, split):
     def discover_pairs(root: Path, ds_names: list[str], sp: str) -> pl.DataFrame:
         rows = []
@@ -319,7 +327,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     MODEL_PRESETS,
     Path,
@@ -360,7 +368,7 @@ def _(
         f"**Checkpoint**: `{ckpt_path}`  \n"
         f"**Config**: `{cfg_dir}/{config_name}`"
     )
-    return (predictor,)
+    return device, predictor
 
 
 @app.cell(hide_code=True)
@@ -376,13 +384,15 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     Image,
     ThreadPoolExecutor,
     as_completed,
+    contextlib,
     cv2,
     datasets,
+    device,
     max_workers,
     mo,
     np,
@@ -398,9 +408,22 @@ def _(
     threading,
     time,
     torch,
+    use_bf16,
 ):
     mo.stop(not run_button.value, mo.md("_Press **Run inference + metrics** to start._"))
     mo.stop(pairs_df.height == 0, mo.md("_No pairs discovered — check dataset root._"))
+
+    # bf16 autocast only applies on CUDA. On CPU we silently fall back to fp32
+    # since bf16 CPU autocast is uneven across torch versions and gives little
+    # benefit here anyway. autocast is a per-thread mode in PyTorch, so we
+    # build a fresh context manager per worker invocation rather than reusing
+    # a single instance across threads.
+    bf16_active = bool(use_bf16.value) and device == "cuda"
+
+    def _autocast():
+        if bf16_active:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
 
     def _run_inference() -> tuple[int, list[str], list[str], float]:
         # Idempotent reset of PredictedMasks for the chosen (dataset, split).
@@ -444,14 +467,13 @@ def _(
                         skipped.append(f"{r['class_name']}/{r['image_id']}")
                     return False
 
-                with predictor_lock:
+                with predictor_lock, _autocast(), torch.no_grad():
                     predictor.set_image(frame_rgb)
-                    with torch.no_grad():
-                        masks_out, _, _ = predictor.predict(
-                            point_coords=np.array(pts),
-                            point_labels=np.array(labels),
-                            multimask_output=False,
-                        )
+                    masks_out, _, _ = predictor.predict(
+                        point_coords=np.array(pts),
+                        point_labels=np.array(labels),
+                        multimask_output=False,
+                    )
                 binary = (masks_out[0] > 0.5).astype(np.uint8) * 255
 
                 out_path = (
@@ -519,9 +541,14 @@ def _(
         _more = "" if len(error_list) <= 10 else f"\n- _…and {len(error_list) - 10} more_"
         _err_md = f"\n\n**Errors**: {len(error_list)}\n{_shown}{_more}"
 
+    _precision_label = "bf16 autocast" if bf16_active else (
+        "fp32 (bf16 requested but device is CPU)" if use_bf16.value else "fp32"
+    )
+
     mo.md(
         f"**Inference complete** in {elapsed:.1f}s  \n"
         f"**Workers**: {max(1, int(max_workers.value))}  \n"
+        f"**Precision**: {_precision_label}  \n"
         f"**Predicted masks written**: {n_written}  \n"
         f"**Skipped (mask had < num_points foreground pixels)**: {len(skipped_no_points)}"
         f"{_err_md}"
@@ -537,7 +564,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(calculate_metrics, cv2, inference_done, mo, pairs_df, pl, root):
     mo.stop(not inference_done, mo.md("_(metrics run after inference)_"))
 
@@ -587,7 +614,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(metrics_df, mo, pl):
     per_class = (
         metrics_df.group_by(["dataset", "class_name"])
@@ -616,7 +643,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(metrics_df, mo, pl):
     overall = (
         metrics_df.group_by("dataset")
@@ -645,7 +672,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(alt, per_class):
     chart = (
         alt.Chart(per_class)
@@ -671,7 +698,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     Path,
     eval_results_dir,
