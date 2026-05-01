@@ -1,8 +1,9 @@
-"""Shared helpers for SurgiSAM2 evaluation notebooks.
+"""Shared helpers for SurgiSAM2 evaluation **and** preprocessing notebooks.
 
-Each per-dataset eval notebook is a thin shim around these functions. Anything
-dataset-specific (frame file extension, dataset name, CSV filename prefix)
-is passed in as a parameter — no per-dataset branching lives here.
+Each per-dataset notebook is a thin shim around these functions. Anything
+dataset-specific (frame file extension, dataset name, CSV filename prefix,
+output directory layout) is passed in as a parameter — no per-dataset
+branching lives here.
 """
 
 from __future__ import annotations
@@ -113,6 +114,11 @@ def discover_pairs(
     `frame_ext` is the extension (without dot) of the corresponding frame
     files in `Frames/`. m2caiSeg/Endoscapes use `jpg`; UD/Dresden/CholecSeg8k
     use `png`. Masks with no matching frame are dropped.
+
+    Note: only handles flat layouts (one class dir, no further nesting).
+    For datasets with nested mask layouts (Dresden/CholecSeg8k), use
+    `load_pairs_from_csvs` instead — the canonical CSVs already encode
+    the correct frame ↔ mask pairing for any layout.
     """
     ext = frame_ext.lstrip(".").lower()
     rows: list[dict] = []
@@ -142,6 +148,59 @@ def discover_pairs(
     if not rows:
         return pl.DataFrame(schema=_PAIR_SCHEMA)
     return pl.DataFrame(rows)
+
+
+def load_pairs_from_csvs(
+    root: Path, ds_names: list[str], split: str,
+) -> pl.DataFrame:
+    """Load pairs from `{root}/{ds}_{split}.csv` files (canonical splits).
+
+    Each CSV must have `mask`, `frame`, `class_name` columns. Path values
+    are interpreted relative to `root` and resolved to absolute paths.
+    Works for any on-disk layout (flat or nested) since the CSV encodes
+    the explicit frame ↔ mask pairing.
+
+    `image_id` is set to the mask file's stem; for nested datasets it
+    may not be unique on its own — use `mask_path` as the unique key
+    when constructing predicted-mask paths.
+    """
+    rows: list[dict] = []
+    missing: list[str] = []
+    for ds in ds_names:
+        csv_path = root / f"{ds}_{split}.csv"
+        if not csv_path.is_file():
+            missing.append(str(csv_path))
+            continue
+        df = pl.read_csv(csv_path)
+        for r in df.iter_rows(named=True):
+            mask_rel = r["mask"]
+            frame_rel = r["frame"]
+            mask_abs = (root / mask_rel).resolve()
+            frame_abs = (root / frame_rel).resolve()
+            rows.append({
+                "dataset": ds,
+                "split": split,
+                "class_name": r["class_name"],
+                "image_id": Path(mask_rel).stem,
+                "frame_path": str(frame_abs),
+                "mask_path": str(mask_abs),
+            })
+    if not rows:
+        return pl.DataFrame(schema=_PAIR_SCHEMA)
+    return pl.DataFrame(rows)
+
+
+def predicted_path_for(
+    root: Path, dataset: str, split: str, mask_path: Path | str,
+) -> Path:
+    """Mirror a mask's path under `PredictedMasks/` (preserves any nesting).
+
+    Mask layout: `{root}/{dataset}/{split}/Masks/{class}/[nested...]/{stem}.png`
+    Predicted:   `{root}/{dataset}/{split}/PredictedMasks/{class}/[nested...]/{stem}.png`
+    """
+    ds_split = root / dataset / split
+    rel = Path(mask_path).resolve().relative_to((ds_split / "Masks").resolve())
+    return ds_split / "PredictedMasks" / rel
 
 
 # ---------------------------------------------------------------------------
@@ -258,9 +317,8 @@ def run_threaded_inference(
                 )
             binary = (masks_out[0] > 0.5).astype(np.uint8) * 255
 
-            out_path = (
-                root / r["dataset"] / r["split"]
-                / "PredictedMasks" / r["class_name"] / f"{r['image_id']}.png"
+            out_path = predicted_path_for(
+                root, r["dataset"], r["split"], r["mask_path"],
             )
             with output_lock:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,9 +392,8 @@ def compute_metrics(pairs_df: pl.DataFrame, root: Path) -> pl.DataFrame:
     """Read GT + predicted masks for every row of `pairs_df` and compute metrics."""
     rows: list[dict] = []
     for r in pairs_df.iter_rows(named=True):
-        pred_path = (
-            root / r["dataset"] / r["split"]
-            / "PredictedMasks" / r["class_name"] / f"{r['image_id']}.png"
+        pred_path = predicted_path_for(
+            root, r["dataset"], r["split"], r["mask_path"],
         )
         if not pred_path.is_file():
             continue
@@ -441,3 +498,149 @@ def save_eval_csvs(
         df.write_csv(p)
         written.append(p)
     return written
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing helpers (shared across the five PreProcessingMasks notebooks)
+# ---------------------------------------------------------------------------
+
+def reset_split_dirs(
+    out_root: Path, splits: tuple[str, ...] = ("train", "val", "test"),
+) -> None:
+    """Remove `{out_root}/{split}` for each split. Idempotent.
+
+    Used by all preprocessing notebooks before re-writing outputs. Only
+    deletes the named split dirs — siblings of `out_root` are left alone.
+    """
+    for split in splits:
+        split_dir = out_root / split
+        if split_dir.exists():
+            shutil.rmtree(split_dir)
+
+
+def to_uint8_binary(source: Path | str | np.ndarray) -> np.ndarray:
+    """Normalize any mask source to a uint8 binary mask in {0, 255}.
+
+    Accepts a Path/str (opened via PIL) or an existing numpy array.
+    Handles bool, uint8 {0, 1}, uint8 {0, 255}, RGB-flattened, and any
+    truthy >0 array. Output is always 2-D uint8 with values 0 or 255.
+    """
+    if isinstance(source, (str, Path)):
+        with Image.open(source) as im:
+            arr = np.asarray(im)
+    else:
+        arr = np.asarray(source)
+
+    if arr.ndim == 3:
+        arr = arr.any(axis=-1)
+
+    if arr.dtype == np.bool_:
+        return arr.astype(np.uint8) * 255
+    if arr.dtype == np.uint8:
+        unique = set(np.unique(arr).tolist())
+        if unique <= {0, 255}:
+            return arr
+        if unique <= {0, 1}:
+            return arr * 255
+    return ((arr > 0).astype(np.uint8) * 255)
+
+
+def invert_class_video_splits(
+    canonical_splits: dict[str, dict[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Flatten `{class: {key: split}}` → `{(class, key): split}`.
+
+    Used by CSV-driven split loaders that build a nested dict of
+    `class → patient/video → split` and need O(1) lookup by pair.
+    """
+    return {
+        (cls, key): split
+        for cls, m in canonical_splits.items()
+        for key, split in m.items()
+    }
+
+
+def validate_frames_masks_paired(
+    out_root: Path,
+    splits: tuple[str, ...] = ("train", "val", "test"),
+    *,
+    frame_for_mask: Callable[[Path, Path, Path], Path] | None = None,
+    frame_ext: str = "png",
+) -> tuple[list[str], int]:
+    """For every mask under `{split}/Masks/...`, verify a same-size frame exists.
+
+    `frame_for_mask(mask_path, masks_root, frames_root)` returns the
+    expected frame path. If `None`, defaults to a flat frames layout:
+    `frames_root / f"{mask_path.stem}.{frame_ext}"`.
+
+    Returns `(issues, n_checked)`. `issues` is a list of human-readable
+    one-liners — caller decides how to display them.
+    """
+    if frame_for_mask is None:
+        def frame_for_mask(  # type: ignore[no-redef]
+            mask_path: Path, masks_root: Path, frames_root: Path,
+        ) -> Path:
+            return frames_root / f"{mask_path.stem}.{frame_ext}"
+
+    issues: list[str] = []
+    n = 0
+    for sp in splits:
+        masks_root = out_root / sp / "Masks"
+        frames_root = out_root / sp / "Frames"
+        if not masks_root.is_dir():
+            continue
+        for mask_path in sorted(masks_root.rglob("*.png")):
+            rel_for_msg = mask_path.relative_to(masks_root)
+            frame_path = frame_for_mask(mask_path, masks_root, frames_root)
+            if not frame_path.is_file():
+                issues.append(f"[{sp}] missing frame for {rel_for_msg}")
+                continue
+            with Image.open(frame_path) as fi, Image.open(mask_path) as mi:
+                if fi.size != mi.size:
+                    issues.append(
+                        f"[{sp}] shape mismatch {rel_for_msg}: "
+                        f"frame {fi.size} vs mask {mi.size}"
+                    )
+            n += 1
+    return issues, n
+
+
+def build_counts_df(written_records: list[dict]) -> pl.DataFrame:
+    """Aggregate per-image written-records into per-(split, class) counts.
+
+    Each record must have at least `split` and `class` keys. Returns
+    `pl.DataFrame` with columns `[split, class, count]` sorted by
+    `[class, split]`.
+    """
+    if not written_records:
+        return pl.DataFrame(
+            schema={"split": pl.String, "class": pl.String, "count": pl.UInt32}
+        )
+    return (
+        pl.DataFrame(written_records)
+        .group_by(["split", "class"])
+        .len(name="count")
+        .sort(["class", "split"])
+    )
+
+
+def class_counts_chart(
+    counts_df: pl.DataFrame,
+    *,
+    x_title: str = "Organ class",
+    width: int = 720,
+    height: int = 320,
+) -> alt.Chart:
+    """Grouped Altair bar chart of per-class mask counts colored by split."""
+    return (
+        alt.Chart(counts_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("class:N", sort="-y", title=x_title),
+            y=alt.Y("count:Q", title="Mask count"),
+            color=alt.Color("split:N", title="Split"),
+            xOffset="split:N",
+            tooltip=["class", "split", "count"],
+        )
+        .properties(width=width, height=height)
+    )
