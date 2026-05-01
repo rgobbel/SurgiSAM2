@@ -1,0 +1,25 @@
+[project]
+name = "surgisam2"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "altair>=6.1.0",
+    "ipykernel>=7.2.0",
+    "marimo==0.23.4",
+    "opencv-python>=4.13.0.92",
+    "pandas>=3.0.2",
+    "pillow>=12.2.0",
+    "polars>=1.40.1",
+    "pyarrow>=24.0.0",
+    "sam2==1.1.0",
+    "segment-anything>=1.0",
+    "torch>=2.11.0",
+    "watchdog>=6.0.0",
+]
+
+[tool.marimo.runtime]
+watcher_on_save = "autorun"
+
+[tool.uv.sources]
+marimo = { path = "packages/marimo-0.23.4-py3-none-any.whl" }
+
